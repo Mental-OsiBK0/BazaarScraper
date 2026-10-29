@@ -1,72 +1,75 @@
-# Oyundaki market ekranından ürün isimlerini OCR ile okuyor
-# python main.py resim.png
+# Oyundaki market ekranından belli renkteki isimleri okuyup ekrandaki konumlarını buluyor
+# python main.py pazar.png
 # python main.py --ekran --bolge 100 200 600 700  (koordinatlar konum.py ile)
 
 import argparse
 import sys
 
-from PIL import Image, ImageEnhance, ImageFilter, ImageGrab, ImageOps, ImageStat
+import cv2
+import numpy as np
 import pytesseract
+from PIL import ImageGrab
 
-DIL = "tur"
-
-
-def kontrast(image):
-    image = ImageEnhance.Contrast(image).enhance(2.0)
-    return image.filter(ImageFilter.SHARPEN)
+RENK = "FFFF80"  # marketteki isimlerin rengi
+BUYUTME = 2
 
 
-def buyut(image, oran=2):
-    # küçük yazılarda büyütünce daha iyi okuyor
-    return image.resize((image.width * oran, image.height * oran), Image.LANCZOS)
+def hex_to_bgr(hex_renk):
+    hex_renk = hex_renk.lstrip("#")
+    r, g, b = (int(hex_renk[i:i + 2], 16) for i in (0, 2, 4))
+    return np.array([b, g, r])
 
 
-def esikleme(image, esik=150):
-    image = ImageOps.grayscale(buyut(image))
-    image = ImageEnhance.Contrast(image).enhance(2.0)
-    image = image.point(lambda p: 255 if p > esik else 0)
-    # arka plan koyuysa ters çevir, tesseract beyaz zemin siyah yazıyı seviyor
-    if ImageStat.Stat(image).mean[0] < 128:
-        image = ImageOps.invert(image)
-    return image
+def renk_maskele(image, hex_renk, tolerans):
+    # sadece aradığımız renge yakın pikseller kalsın
+    renk = hex_to_bgr(hex_renk)
+    alt = np.clip(renk - tolerans, 0, 255).astype(np.uint8)
+    ust = np.clip(renk + tolerans, 0, 255).astype(np.uint8)
+    maske = cv2.inRange(image, alt, ust)
+
+    # tesseract beyaz zemin siyah yazıyı daha iyi okuyor
+    sonuc = cv2.bitwise_not(maske)
+    return cv2.resize(sonuc, None, fx=BUYUTME, fy=BUYUTME, interpolation=cv2.INTER_CUBIC)
 
 
-YONTEMLER = {"kontrast": kontrast, "buyut": buyut, "esikleme": esikleme}
-
-
-def dil_kontrol(dil):
-    try:
-        kurulu = pytesseract.get_languages()
-    except pytesseract.TesseractNotFoundError:
-        sys.exit("Tesseract kurulu değil")
-    if dil not in kurulu:
-        sys.exit(f"'{dil}' dil paketi yok, kurulu olanlar: {', '.join(kurulu)}")
-
-
-def oku(image, dil=DIL):
-    metin = pytesseract.image_to_string(image, lang=dil)
-    satirlar = [s.strip() for s in metin.splitlines()]
-    # boş satırları ve tek karakterlik çöpleri at
-    return [s for s in satirlar if len(s) >= 2 and any(c.isalpha() for c in s)]
+def kelimeleri_bul(image, dil, offset):
+    # image_to_boxes harf harf veriyordu, image_to_data kelime kelime veriyor
+    veri = pytesseract.image_to_data(image, lang=dil, config="--psm 6",
+                                     output_type=pytesseract.Output.DICT)
+    kelimeler = []
+    for i, metin in enumerate(veri["text"]):
+        metin = metin.strip()
+        if len(metin) < 2 or float(veri["conf"][i]) < 30:
+            continue
+        # büyütmeyi geri al, bölge kesildiyse ekran koordinatına çevir
+        x = (veri["left"][i] + veri["width"][i] // 2) // BUYUTME + offset[0]
+        y = (veri["top"][i] + veri["height"][i] // 2) // BUYUTME + offset[1]
+        kelimeler.append((metin, x, y))
+    return kelimeler
 
 
 def goruntu_al(dosya, ekran, bolge):
     if ekran:
-        return ImageGrab.grab(bbox=tuple(bolge) if bolge else None)
-    try:
-        image = Image.open(dosya)
-    except FileNotFoundError:
-        sys.exit(f"{dosya} bulunamadı")
-    return image.crop(tuple(bolge)) if bolge else image
+        ss = ImageGrab.grab(bbox=tuple(bolge) if bolge else None)
+        return cv2.cvtColor(np.array(ss), cv2.COLOR_RGB2BGR)
+    image = cv2.imread(dosya)
+    if image is None:
+        sys.exit(f"{dosya} açılamadı")
+    if bolge:
+        x1, y1, x2, y2 = bolge
+        image = image[y1:y2, x1:x2]
+    return image
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("dosya", nargs="?")
     parser.add_argument("--ekran", action="store_true", help="dosya yerine ekranı oku")
-    parser.add_argument("--yontem", choices=[*YONTEMLER, "hepsi"], default="esikleme")
     parser.add_argument("--bolge", type=int, nargs=4, metavar=("X1", "Y1", "X2", "Y2"))
-    parser.add_argument("--dil", default=DIL)
+    parser.add_argument("--renk", default=RENK, help="aranan yazı rengi, örn FFFF80")
+    parser.add_argument("--tolerans", type=int, default=40)
+    parser.add_argument("--dil", default="tur")
+    parser.add_argument("--maske", help="ara görüntüyü kaydet, ayar yaparken işe yarıyor")
     parser.add_argument("-o", "--cikti", help="sonuçları txt'ye yaz")
     args = parser.parse_args()
 
@@ -74,28 +77,29 @@ def main():
         parser.error("resim ver ya da --ekran kullan")
     if args.bolge and (args.bolge[2] <= args.bolge[0] or args.bolge[3] <= args.bolge[1]):
         parser.error("bölge koordinatları ters")
-    dil_kontrol(args.dil)
+    try:
+        if args.dil not in pytesseract.get_languages():
+            sys.exit(f"'{args.dil}' dil paketi yok")
+    except pytesseract.TesseractNotFoundError:
+        sys.exit("Tesseract kurulu değil")
 
     image = goruntu_al(args.dosya, args.ekran, args.bolge)
-    if args.yontem == "hepsi":
-        secilenler = YONTEMLER
-    else:
-        secilenler = {args.yontem: YONTEMLER[args.yontem]}
+    islenmis = renk_maskele(image, args.renk, args.tolerans)
+    if args.maske:
+        cv2.imwrite(args.maske, islenmis)
 
-    sonuc = []
-    for ad, yontem in secilenler.items():
-        urunler = oku(yontem(image), args.dil)
-        print(f"\n[{ad}] {len(urunler)} satır")
-        for urun in urunler:
-            print("  -", urun)
-        sonuc += [f"[{ad}]", *urunler, ""]
+    offset = args.bolge[:2] if args.bolge else (0, 0)
+    kelimeler = kelimeleri_bul(islenmis, args.dil, offset)
+
+    print(f"{len(kelimeler)} isim bulundu\n")
+    for metin, x, y in kelimeler:
+        print(f"{metin:<20} ({x}, {y})")
 
     if args.cikti:
         with open(args.cikti, "w", encoding="utf-8") as f:
-            f.write("\n".join(sonuc))
+            f.writelines(f"{m}\t{x}\t{y}\n" for m, x, y in kelimeler)
         print(f"\n{args.cikti} kaydedildi")
 
 
 if __name__ == "__main__":
     main()
-    
